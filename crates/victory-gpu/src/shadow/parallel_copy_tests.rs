@@ -62,8 +62,8 @@ impl Drop for GuestMemory {
         if let Some(mirror) = self.mirror {
             for address in [self.base, mirror] {
                 crate::watch::title_memory_remapped(address, COPY_LEN);
-                // SAFETY: the copy trackers are gone and these views belong to the fixture.
                 assert_ne!(
+                    // SAFETY: the copy trackers are gone and these views belong to the fixture.
                     unsafe {
                         UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                             Value: address as *mut _,
@@ -184,8 +184,8 @@ fn exercise(layout: Layout) -> (bool, bool) {
     let parallel =
         MARKED_COPY_BACK_PARALLEL.with(|taken| taken.take().expect("marked copy-back ran"));
     for mark in marks {
-        // SAFETY: the same mapped bitmap.
         assert_eq!(
+            // SAFETY: the same mapped bitmap.
             unsafe { *bits.add(mark as usize / 32) } & (1 << (mark % 32)),
             0
         );
