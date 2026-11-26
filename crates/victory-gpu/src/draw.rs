@@ -4325,6 +4325,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    #[path = "r16_volume_fixture.rs"]
+    mod r16_volume_fixture;
+
     /// A texture written through an unordered view and copied into a title
     /// buffer (a read back) reaches the buffer's title memory once the
     /// submission has run (#50: the title waited on such a copy).

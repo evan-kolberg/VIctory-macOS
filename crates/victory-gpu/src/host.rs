@@ -75,6 +75,8 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// The list every submission ends with, made on first use ([`Mark`]).
     mark: OnceLock<Option<Mark>>,
+    /// Extra marks for native calls before the final call of a split submission.
+    split_marks: Mutex<Option<Vec<Mark>>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -372,6 +374,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
+            split_marks: Mutex::new(Some(Vec::new())),
             event,
             rtvs,
             rtv_size,
@@ -559,7 +562,16 @@ pub(crate) mod tests {
         unsafe { DestroyWindow(hwnd) }.unwrap();
     }
 
+    #[derive(Default)]
+    struct NativeCallTrace {
+        groups: Vec<(Vec<usize>, bool)>,
+        calls: Vec<usize>,
+    }
+
     thread_local! {
+        static NATIVE_CALLS: std::cell::RefCell<Option<NativeCallTrace>> =
+            const { std::cell::RefCell::new(None) };
+
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -568,6 +580,32 @@ pub(crate) mod tests {
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    pub(crate) fn start_native_call_trace() {
+        NATIVE_CALLS.with(|trace| {
+            assert!(trace.borrow_mut().replace(NativeCallTrace::default()).is_none());
+        });
+    }
+
+    pub(crate) fn take_native_call_trace() -> Vec<(Vec<usize>, bool)> {
+        NATIVE_CALLS.with(|trace| trace.borrow_mut().take().unwrap().groups)
+    }
+
+    pub(super) fn native_call(lists: usize) {
+        NATIVE_CALLS.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.calls.push(lists);
+            }
+        });
+    }
+
+    pub(super) fn native_call_group(fence_waited: bool) {
+        NATIVE_CALLS.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.groups.push((std::mem::take(&mut trace.calls), fence_waited));
+            }
+        });
     }
 
     /// Replays transitions in the order the GPU runs them from the states
@@ -1093,6 +1131,13 @@ pub(crate) fn dred_on() -> bool {
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// On D3DMetal, a separate native queue call before a deferred UAV-to-SRV
+/// prelude can make the preceding producer's writes visible.
+fn split_uav_srv_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1642,6 +1687,12 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let gpu_timing = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let gpu_timing = false;
+        let split_preludes = !gpu_timing && split_uav_srv_prelude();
+        let mut native_boundaries = Vec::new();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -1651,7 +1702,10 @@ impl Host {
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
+            if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
+                if uav_to_srv && !lists.is_empty() {
+                    native_boundaries.push(lists.len());
+                }
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -1664,7 +1718,7 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if gpu_timing {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -1677,6 +1731,43 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        // A failed earlier call may leave the queue able to run the final mark.
+        // Give each native call its own mark so failure recovery can see it.
+        if mark.is_none() {
+            native_boundaries.clear();
+        }
+        let mut split_pool = (!native_boundaries.is_empty())
+            .then(|| self.split_marks.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(pool) = split_pool.as_deref_mut() {
+            if let Some(marks) = pool.as_mut()
+                && let Err(error) = (marks.len()..native_boundaries.len()).try_for_each(|_| {
+                    marks.push(Mark::new(self)?);
+                    Ok::<_, windows::core::Error>(())
+                })
+            {
+                tracing::warn!(
+                    %error,
+                    "could not make split submission marks, keeping the native batch together"
+                );
+                *pool = None;
+            }
+            if pool.is_none() {
+                native_boundaries.clear();
+            }
+        }
+        let split_marks = split_pool
+            .as_deref()
+            .and_then(Option::as_deref)
+            .unwrap_or(&[]);
+        if !native_boundaries.is_empty() {
+            static FIRST_SPLIT: std::sync::Once = std::sync::Once::new();
+            FIRST_SPLIT.call_once(|| {
+                tracing::info!(
+                    native_calls = native_boundaries.len() + 1,
+                    "split host submission at deferred UAV-to-SRV preludes"
+                );
+            });
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1691,7 +1782,20 @@ impl Host {
             let queue = self.queue();
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
-                queue.ExecuteCommandLists(&group);
+                // All native calls share the existing fence signal and wait.
+                let mut first = 0;
+                for (&end, mark) in native_boundaries.iter().zip(split_marks) {
+                    mark.arm(*submitted);
+                    let mut marked = group[first..end].to_vec();
+                    marked.push(mark.list());
+                    #[cfg(test)]
+                    tests::native_call(marked.len());
+                    queue.ExecuteCommandLists(&marked);
+                    first = end;
+                }
+                #[cfg(test)]
+                tests::native_call(group.len() - first);
+                queue.ExecuteCommandLists(&group[first..]);
                 let waited = queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
@@ -1706,9 +1810,12 @@ impl Host {
                     }
                 }
             };
+            #[cfg(test)]
+            tests::native_call_group(waited);
             if waited
                 && let Some(mark) = mark
-                && !mark.saw(*submitted)
+                && (!mark.saw(*submitted)
+                    || split_marks.iter().take(native_boundaries.len()).any(|m| !m.saw(*submitted)))
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
@@ -2567,7 +2674,7 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, detect_uav_to_srv: bool) -> Option<(ID3D12CommandList, bool)> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -2576,12 +2683,16 @@ impl HostList {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies start from the real states, then the list's moves from
         // them; only after both do they become the states the list leaves.
-        let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
+        let mut uav_to_srv = false;
+        let mut moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
             states
                 .values()
                 .filter_map(|(first, _, copy)| {
                     let real = copy.state.load(Ordering::Relaxed);
                     (real != *first).then(|| {
+                        uav_to_srv |= detect_uav_to_srv
+                            && real == D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32
+                            && *first & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32 != 0;
                         transition(&copy.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(*first as i32))
                     })
                 })
@@ -2634,7 +2745,7 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        list.cast().ok().map(|list| (list, uav_to_srv))
     }
 
     /// Notes what the command about to be recorded does, as a marker
